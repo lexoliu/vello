@@ -12,6 +12,10 @@ Subheadings to categorize changes are `added, changed, deprecated, removed, fixe
 
 This release has an [MSRV][] of 1.89.
 
+### Fixed
+
+- Prefix-sum lookups no longer index workgroup arrays with an underflowed index in the discarded arm of a `select`, which caused a device loss on Mali GPUs for any scene containing a path. ([#1817][] by [@lexoliu][])
+
 ## [0.11.0][] - 2026-10-02
 
 This release has an [MSRV][] of 1.89.
@@ -354,6 +358,7 @@ This release has an [MSRV][] of 1.75.
 [@Keavon]: https://github.com/Keavon
 [@kmoon2437]: https://github.com/kmoon2437
 [@LaurenzV]: https://github.com/LaurenzV
+[@lexoliu]: https://github.com/lexoliu
 [@msiglreith]: https://github.com/msiglreith
 [@nicoburns]: https://github.com/nicoburns
 [@oscargus]: https://github.com/oscargus
@@ -480,6 +485,7 @@ This release has an [MSRV][] of 1.75.
 [#1700]: https://github.com/linebender/vello/pull/1700
 [#1774]: https://github.com/linebender/vello/pull/1774
 [#1777]: https://github.com/linebender/vello/pull/1777
+[#1817]: https://github.com/linebender/vello/pull/1817
 [#1847]: https://github.com/linebender/vello/pull/1847
 [#1909]: https://github.com/linebender/vello/pull/1909
 [#1936]: https://github.com/linebender/vello/pull/1936
