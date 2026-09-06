@@ -1985,14 +1985,20 @@ impl Programs {
             atlas_count > 0,
             "atlas texture arrays must have at least one physical layer"
         );
-        // In WGPU's GLES backend, heuristics classify a one-layer texture as D2 even when it was
-        // created as D2Array. Allocate at least two physical layers on WASM to keep the backend's
-        // classification consistent with the D2Array view.
+        // wgpu's GL backend picks a texture's GL target from its layer count
+        // (`get_info_from_desc` in wgpu-hal's gles backend): a `D2` texture with
+        // one layer becomes `TEXTURE_2D`, and the `D2Array` view over it then
+        // binds a target the shader's `texture_2d_array` cannot sample, so
+        // every image comes out black. That backend is WebGL on wasm and
+        // EGL/GL on native, so the decision is the adapter's rather than the
+        // target's: keep two physical layers wherever the heuristic applies so
+        // the classification matches the view.
         // See https://github.com/gfx-rs/wgpu/blob/61e5124eb9530d3b3865556a7da4fd320d03ddc5/wgpu-hal/src/gles/mod.rs#L470-L517.
-        #[cfg(target_arch = "wasm32")]
-        let depth_or_array_layers = atlas_count.max(2);
-        #[cfg(not(target_arch = "wasm32"))]
-        let depth_or_array_layers = atlas_count;
+        let depth_or_array_layers = if device.adapter_info().backend == wgpu::Backend::Gl {
+            atlas_count.max(2)
+        } else {
+            atlas_count
+        };
 
         let atlas_texture_array = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Atlas Texture Array"),
