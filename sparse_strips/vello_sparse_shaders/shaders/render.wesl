@@ -632,7 +632,13 @@ const EXTEND_REFLECT: u32 = 2u;
 fn extend_mode(t: f32, mode: u32, max: f32) -> f32 {
     switch mode {
         case EXTEND_PAD: {
-            return clamp(t, 0.0, max - 1.0);
+            // `t` is a sampling position in image space, where texel `i` covers `[i, i + 1)` and
+            // has its centre at `i + 0.5`. Padding saturates that position at the centres of the
+            // outermost texels, so the whole first and last texel remain reachable: filtered
+            // sampling subtracts the half texel that turns a centre into a corner *after* this
+            // clamp, and clamping to `max - 1.0` here would stop half a texel short of the last
+            // centre, freezing the trailing edge on a blend of the final two texels.
+            return clamp(t, 0.5, max - 0.5);
         }
         case EXTEND_REPEAT: {
             return extend_mode_normalized(t / max, mode) * max;
