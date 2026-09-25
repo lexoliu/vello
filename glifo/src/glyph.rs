@@ -868,7 +868,7 @@ impl<'a, 'b, Glyphs: Iterator<Item = Glyph> + Clone> GlyphRunRenderer<'a, 'b, Gl
         // Collect and merge exclusion zones from all glyphs.
         let exclusions = &mut self.underline_span_cache;
         // We `drain` this when creating the iterator, but just in case...
-        exclusions.truncate(0);
+        exclusions.clear();
 
         for glyph in self.glyph_iterator.clone() {
             // TODO: skip ink for color and bitmap glyphs
@@ -1654,6 +1654,20 @@ impl Debug for PreparedGlyphRun<'_> {
 
 /// Prepare a glyph run for rendering.
 fn prepare_glyph_run<'a>(run: GlyphRun<'a>, hint_cache: &'a mut HintCache) -> PreparedGlyphRun<'a> {
+    // An all-default location and the empty location name the same
+    // instance. skrifa stores `LocationRef::effective_coords` (`&[]`) on
+    // its instances, so keyed caches (hinting, outline, atlas) must all see
+    // the canonical form too — otherwise `[0, 0, ...]` never matches a
+    // stored entry and every run repays a reconfigure.
+    let normalized_coords = if run
+        .normalized_coords
+        .iter()
+        .all(|c| *c == skrifa::instance::NormalizedCoord::ZERO)
+    {
+        &[][..]
+    } else {
+        run.normalized_coords
+    };
     let full_transform = run.transform * run.glyph_transform.unwrap_or(Affine::IDENTITY);
     let [_, _, t_c, t_d, t_e, t_f] = full_transform.as_coeffs();
 
@@ -1715,7 +1729,7 @@ fn prepare_glyph_run<'a>(run: GlyphRun<'a>, hint_cache: &'a mut HintCache) -> Pr
                 font_index: run.font.index,
                 outlines: &outlines,
                 size: vertical_font_size,
-                coords: run.normalized_coords,
+                coords: normalized_coords,
             });
 
             (
@@ -1759,7 +1773,7 @@ fn prepare_glyph_run<'a>(run: GlyphRun<'a>, hint_cache: &'a mut HintCache) -> Pr
             font_size: draw_font_size,
         },
         scene_paint_transform: run.scene_paint_transform,
-        normalized_coords: run.normalized_coords,
+        normalized_coords,
         hinting_instance,
     }
 }
@@ -2302,6 +2316,31 @@ mod tests {
 
     const _NORMALISED_COORD_SIZE_MATCHES: () =
         assert!(size_of::<skrifa::instance::NormalizedCoord>() == size_of::<NormalizedCoord>());
+
+    /// An explicit all-default location and the empty location name the same
+    /// instance: repeated runs with `[0, 0, ...]` coords must reuse a single
+    /// hinting instance rather than push a fresh `HintEntry` per run. The
+    /// cache stores `effective_coords` (`[]`), so keying by raw coords would
+    /// never match.
+    #[test]
+    fn all_default_coords_share_one_hinting_instance() {
+        let font = test_font(TestGlyphKind::Outline);
+        let coords = [skrifa::instance::NormalizedCoord::ZERO; 2];
+        let run = GlyphRun {
+            font,
+            font_size: 20.0,
+            font_embolden: FontEmbolden::default(),
+            transform: Affine::IDENTITY,
+            scene_paint_transform: Affine::IDENTITY,
+            glyph_transform: None,
+            normalized_coords: &coords,
+            hint: true,
+        };
+        let mut hinting = HintCache::default();
+        prepare_glyph_run(run.clone(), &mut hinting);
+        prepare_glyph_run(run, &mut hinting);
+        assert_eq!(hinting.glyf_entries.len(), 1);
+    }
 
     const ROBOTO_FONT: &[u8] = include_bytes!("../../assets/roboto/Roboto-Regular.ttf");
     const NOTO_COLR_FONT: &[u8] =
