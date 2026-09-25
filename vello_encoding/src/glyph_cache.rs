@@ -38,6 +38,14 @@ impl GlyphCache {
         let font_id = font.data.id();
         let font_index = font.index;
         let font = skrifa::FontRef::from_index(font.data.as_ref(), font.index).ok()?;
+        // An all-default location and the empty location name the same
+        // instance — key the var map and the hinting cache by the canonical
+        // form (`&[]`), matching skrifa's `effective_coords`.
+        let coords = if coords.iter().all(|c| *c == NormalizedCoord::ZERO) {
+            &[][..]
+        } else {
+            coords
+        };
         let map = if !coords.is_empty() {
             // This is still ugly in rust. Choices are:
             // 1. multiple lookups in the hashmap (implemented here)
