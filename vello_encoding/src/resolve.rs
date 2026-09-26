@@ -188,7 +188,22 @@ impl Resolver {
         let resources = &encoding.resources;
         if resources.patches.is_empty() {
             let layout = resolve_solid_paths_only(encoding, packed);
-            return (layout, Ramps::default(), Images::default());
+            // The renderer keeps one persistent atlas texture, sized from the
+            // returned `Images`, and several encodings can share this resolver.
+            // Reporting `Images::default()` here would make it free that atlas
+            // even though the cache still holds resident images from earlier
+            // encodes, so report the live atlas dimensions instead.
+            let (width, height) = self.image_cache.occupied_atlas_size();
+            return (
+                layout,
+                Ramps::default(),
+                Images {
+                    width,
+                    height,
+                    evicted: 0,
+                    images: &[],
+                },
+            );
         }
         let patch_sizes = self.resolve_patches(encoding);
         self.resolve_pending_images();

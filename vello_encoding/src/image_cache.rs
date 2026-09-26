@@ -98,6 +98,22 @@ impl ImageCache {
         }
     }
 
+    /// The live atlas dimensions while images are resident, `(0, 0)` otherwise.
+    ///
+    /// A resolve pass that carries no patches never touches this cache, but the
+    /// renderer still needs the atlas' real size so it does not free the
+    /// texture the residents are stored in.
+    pub(crate) fn occupied_atlas_size(&self) -> (u32, u32) {
+        if self.map.is_empty() {
+            (0, 0)
+        } else {
+            (
+                self.atlas.size().width as u32,
+                self.atlas.size().height as u32,
+            )
+        }
+    }
+
     pub(crate) fn bump_size(&mut self) -> bool {
         let mut new_size = self.atlas.size().width * 2;
         while new_size <= self.max_size {
@@ -230,6 +246,21 @@ mod tests {
         assert_eq!(cache.atlas.size().width, 32);
         cache.begin_resolve();
         assert_eq!(cache.atlas.size().width, 32);
+    }
+
+    #[test]
+    fn occupied_atlas_size_reports_zero_only_while_empty() {
+        let mut cache = ImageCache::new_with_sizes(32, 64);
+        assert_eq!(cache.occupied_atlas_size(), (0, 0));
+
+        let image = image(7, 8, 8);
+        cache.begin_resolve();
+        assert!(cache.get_or_insert(&image).is_some());
+        cache.finish_resolve();
+        assert_eq!(cache.occupied_atlas_size(), (32, 32));
+
+        assert!(cache.bump_size());
+        assert_eq!(cache.occupied_atlas_size(), (64, 64));
     }
 
     #[test]
