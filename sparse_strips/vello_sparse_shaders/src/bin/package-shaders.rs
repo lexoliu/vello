@@ -1,26 +1,27 @@
 // Copyright 2025 the Vello Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Build.
+//! Regenerate `src/generated/compiled_shaders.rs` from `shaders/*.wesl`.
+//!
+//! Run via `./package-shaders.sh`, or directly:
+//! `cargo run -p vello_sparse_shaders --bin package-shaders --features shadergen`.
 
-use std::env;
 use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
 use wesl::Wesl;
 
 #[allow(warnings)]
-#[cfg(feature = "glsl")]
-#[path = "src/compile.rs"]
+#[path = "../compile.rs"]
 mod compile;
 #[allow(warnings)]
-#[cfg(feature = "glsl")]
-#[path = "src/lint/mod.rs"]
+#[path = "../lint/mod.rs"]
 mod lint;
 #[allow(warnings)]
-#[cfg(feature = "glsl")]
-#[path = "src/types.rs"]
+#[path = "../types.rs"]
 mod types;
+
+const PACKAGED_SHADERS: &str = "src/generated/compiled_shaders.rs";
 
 struct ShaderInfo {
     name: String,
@@ -30,17 +31,13 @@ struct ShaderInfo {
 // TODO: Format the generated code via `rustfmt`.
 // TODO: Use `quote` instead of string concatenation to generate code.
 fn main() {
-    // Rerun build if the shaders directory changes
-    println!("cargo:rerun-if-changed=shaders");
-    let out_dir = env::var_os("OUT_DIR").unwrap();
-    // Build outputs a `compiled_shaders.rs` module containing the GLSL source and reflection
-    // metadata.
-    let dest_path = Path::new(&out_dir).join("compiled_shaders.rs");
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let dest_path = manifest_dir.join(PACKAGED_SHADERS);
 
     // Link each WESL root module to WGSL.
-    let shader_dir = PathBuf::from("shaders");
+    let shader_dir = manifest_dir.join("shaders");
     let shader_infos = load_shader_infos(&shader_dir);
-    fs::write(dest_path, generate_compiled_shaders_module(&shader_infos)).unwrap();
+    fs::write(&dest_path, generate_compiled_shaders_module(&shader_infos)).unwrap();
 }
 
 fn load_shader_infos(shader_dir: &Path) -> Vec<ShaderInfo> {
@@ -86,6 +83,9 @@ fn compile_shader<R: wesl::Resolver>(compiler: &Wesl<R>, name: String) -> Shader
 
 fn generate_compiled_shaders_module(shader_infos: &[ShaderInfo]) -> String {
     let mut buf = String::new();
+    writeln!(buf, "// Copyright 2025 the Vello Authors").unwrap();
+    writeln!(buf, "// SPDX-License-Identifier: Apache-2.0 OR MIT").unwrap();
+    writeln!(buf).unwrap();
     writeln!(
         buf,
         "// Generated code by `vello_sparse_shaders` - DO NOT EDIT"
@@ -112,25 +112,24 @@ fn generate_compiled_shaders_module(shader_infos: &[ShaderInfo]) -> String {
     writeln!(buf, "}}").unwrap();
 
     // Implementation for creating a CompiledGlsl struct per shader assuming the standard entry
-    // names of `vs_main` and `fs_main`.
-    #[cfg(feature = "glsl")]
-    {
-        writeln!(
-            buf,
-            "/// Build-time GLSL shaders derived from linked WESL modules."
-        )
-        .unwrap();
+    // names of `vs_main` and `fs_main`. These items exist only for consumers that enable the
+    // `glsl` feature, so they are emitted behind a `cfg` gate in the checked-in artifact.
+    writeln!(
+        buf,
+        "/// Build-time GLSL shaders derived from linked WESL modules."
+    )
+    .unwrap();
 
-        for shader_info in shader_infos {
-            let shader = compile::compile_wgsl_shader(
-                &shader_info.wgsl_source,
-                &shader_info.name,
-                "vs_main",
-                "fs_main",
-            );
-            let generated_code = shader.to_generated_code(&shader_info.name);
-            writeln!(buf, "{generated_code}").unwrap();
-        }
+    for shader_info in shader_infos {
+        let shader = compile::compile_wgsl_shader(
+            &shader_info.wgsl_source,
+            &shader_info.name,
+            "vs_main",
+            "fs_main",
+        );
+        let generated_code = shader.to_generated_code(&shader_info.name);
+        writeln!(buf, "#[cfg(feature = \"glsl\")]").unwrap();
+        writeln!(buf, "{generated_code}").unwrap();
     }
 
     buf

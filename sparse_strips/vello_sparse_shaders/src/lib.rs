@@ -10,7 +10,8 @@ mod lint;
 #[cfg(feature = "glsl")]
 mod types;
 
-include!(concat!(env!("OUT_DIR"), "/compiled_shaders.rs"));
+// The WESL toolchain output is checked in: regenerate with `./package-shaders.sh`.
+include!("generated/compiled_shaders.rs");
 
 #[cfg(all(test, feature = "glsl"))]
 mod tests {

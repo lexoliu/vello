@@ -24,6 +24,17 @@ hybrid rendering engine.
 Whenever the WESL shaders are updated, the build script automatically relinks the WGSL and
 regenerates the GLSL programs used by the crate itself.
 
+The linked WGSL and compiled GLSL modules are checked in at
+[`src/generated/compiled_shaders.rs`](src/generated/compiled_shaders.rs), so building this crate
+does not need the WESL toolchain on the host. After editing `shaders/*.wesl`, regenerate the
+artifact by running:
+
+```sh
+./package-shaders.sh
+```
+
+CI fails if the checked-in artifact is stale relative to the shader sources.
+
 If you want to inspect the generated WebGL GLSL output directly, you can also create a "local copy" that is
 easier to inspect by running:
 
