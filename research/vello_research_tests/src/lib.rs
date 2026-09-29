@@ -65,6 +65,9 @@ pub struct TestParams {
     pub use_cpu: bool,
     pub name: String,
     pub anti_aliasing: AaConfig,
+    /// Overrides [`vello::RendererOptions::buffer_sizes`]; `None` uses the
+    /// renderer default (derived from the target and scene).
+    pub buffer_sizes: Option<vello::BumpBufferSizes>,
 }
 
 impl TestParams {
@@ -76,6 +79,7 @@ impl TestParams {
             use_cpu: false,
             name: name.into(),
             anti_aliasing: AaConfig::Area,
+            buffer_sizes: None,
         }
     }
 }
@@ -87,7 +91,7 @@ pub fn render_then_debug_sync(scene: &Scene, params: &TestParams) -> Result<Imag
 pub async fn render_then_debug(scene: &Scene, params: &TestParams) -> Result<ImageData> {
     let image = get_scene_image(params, scene).await?;
     let suffix = if params.use_cpu { "cpu" } else { "gpu" };
-    let name = format!("{}_{suffix}", &params.name);
+    let name = format!("{}_{suffix}", params.name);
     let out_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("debug_outputs")
         .join(name)
@@ -118,6 +122,7 @@ pub async fn get_scene_image(
             num_init_threads: NonZeroUsize::new(1),
             antialiasing_support: std::iter::once(params.anti_aliasing).collect(),
             pipeline_cache: None,
+            buffer_sizes: params.buffer_sizes,
         },
     )
     .or_else(|_| bail!("Got non-Send/Sync error from creating renderer"))?;

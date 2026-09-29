@@ -48,6 +48,11 @@ pub struct BumpAllocatorMemory {
 }
 
 impl BumpAllocators {
+    /// `true` when at least one stage failed to bump-allocate this frame.
+    pub fn failed(&self) -> bool {
+        self.failed != 0
+    }
+
     pub fn memory(&self) -> BumpAllocatorMemory {
         let binning = BufferSize::new(self.binning);
         let ptcl = BufferSize::new(self.ptcl);
@@ -153,8 +158,160 @@ pub struct ConfigUniform {
     pub ptcl_size: u32,
 }
 
+/// Sizes, in elements, for the buffers that the pipeline bump-allocates on
+/// the GPU.
+///
+/// These are only the *initial* allocation for a render: when a frame exceeds
+/// a buffer, the shaders still count the full demand in [`BumpAllocators`] and
+/// the renderer grows the affected buffers and re-renders, so under-sizing
+/// costs a retried frame, never a truncated one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BumpBufferSizes {
+    /// Flattened line soup, in [`LineSoup`] elements.
+    pub lines: u32,
+    /// Binning data, in `u32`s. Includes the `Layout::bin_data_start` prefix.
+    pub bin_data: u32,
+    /// Per-path-per-tile records, in [`Tile`] elements.
+    pub tiles: u32,
+    /// Per-path segment counts, in [`SegmentCount`] elements.
+    pub seg_counts: u32,
+    /// Flattened path segments, in [`PathSegment`] elements.
+    pub segments: u32,
+    /// Blend spill, in `u32` pixels (256 pixels per spilled blend tile).
+    pub blend_spill: u32,
+    /// Per-tile command lists, in `u32`s.
+    pub ptcl: u32,
+}
+
+impl Default for BumpBufferSizes {
+    /// The historical fixed sizes, hand-picked to accommodate the vello test
+    /// scenes as well as paris-30k without re-rendering. This allocates ~170 MB
+    /// of bump memory per frame even for trivial scenes; prefer
+    /// [`BumpBufferSizes::for_target`].
+    fn default() -> Self {
+        Self {
+            lines: 1 << 21,
+            bin_data: 1 << 18,
+            tiles: 1 << 21,
+            seg_counts: 1 << 21,
+            segments: 1 << 21,
+            // 16 * 16 (1 << 8) pixels is one blend spill, so this allows for
+            // 4096 spills.
+            blend_spill: 1 << 20,
+            ptcl: 1 << 23,
+        }
+    }
+}
+
+impl BumpBufferSizes {
+    /// Initial sizes derived from the render target and the resolved scene
+    /// layout.
+    ///
+    /// Each buffer is sized a small multiple of the structure it actually
+    /// scales with — viewport tiles for the tile-domain buffers, path and
+    /// draw-object counts for the path-domain buffers — with a floor so
+    /// trivial scenes stay cheap, and capped at the historical constants so a
+    /// derived estimate never exceeds the pre-sizing behaviour. Anything the
+    /// estimate misses is caught and grown by the bump-allocator feedback, so
+    /// these only need to be reasonable, not airtight.
+    pub fn for_layout(layout: &Layout, width_in_tiles: u32, height_in_tiles: u32) -> Self {
+        let n_tiles = width_in_tiles.max(1) * height_in_tiles.max(1);
+        // Bins are 16x16 tiles; each active bin emits a handful of words.
+        let n_bins = width_in_tiles.div_ceil(16).max(1) * height_in_tiles.div_ceil(16).max(1);
+        let n_paths = layout.n_paths.max(1);
+        let n_draw_objects = layout.n_draw_objects;
+        let n_clips = layout.n_clips.max(1);
+        // A rough count of path-tile intersections: every tile a path covers
+        // gets a `seg_counts` entry and some `segments`/`tiles`. A path that
+        // covers many tiles dominates these; assume a handful of intersections
+        // per path plus base coverage.
+        let intersections = n_paths * 4 + n_tiles / 4;
+        let fallback = Self::default();
+        Self {
+            bin_data: (layout.bin_data_start + n_draw_objects * 8 + n_bins * 32)
+                .clamp(1 << 14, fallback.bin_data),
+            // One tile record per (path x covered tile); most tiles see few paths.
+            tiles: (intersections * 2).clamp(1 << 12, fallback.tiles),
+            seg_counts: intersections.clamp(1 << 12, fallback.seg_counts),
+            // Flattened path segments: a few dozen per path on average, scaled
+            // further by tile coverage for long curves.
+            segments: (n_paths * 64 + intersections * 8).clamp(1 << 12, fallback.segments),
+            lines: (n_paths * 16).clamp(1 << 12, fallback.lines),
+            blend_spill: (n_clips * 512).clamp(1 << 14, fallback.blend_spill),
+            // PTCL_INITIAL_ALLOC (64 words, shared/ptcl.wgsl) per tile is
+            // reserved unconditionally by the coarse stage.
+            ptcl: (n_tiles * 96).clamp(1 << 16, fallback.ptcl),
+        }
+    }
+
+    /// Initial sizes derived from the render target alone, for callers that
+    /// configure the renderer before a scene exists. Equivalent to
+    /// [`for_layout`](Self::for_layout) with an empty layout; the
+    /// path-dependent sizes fall back to their floors and grow on demand.
+    pub fn for_target(width: u32, height: u32) -> Self {
+        Self::for_layout(
+            &Layout::default(),
+            width.div_ceil(TILE_WIDTH),
+            height.div_ceil(TILE_HEIGHT),
+        )
+    }
+
+    /// Grow each size to cover the demand reported in `bump`, with headroom so
+    /// the next frame does not immediately overflow again.
+    ///
+    /// `bump` counts allocation indices, not total buffer sizes, so the
+    /// fixed offsets the shaders carve out come from the layout:
+    /// `bin_data_start` words of `bin_data` hold the info/bin prefix
+    /// (binning.wgsl compares `bump.binning` against `binning_size`), and
+    /// `n_tiles * PTCL_INITIAL_ALLOC` (64 words per tile, shared/ptcl.wgsl)
+    /// is reserved at the head of `ptcl` before `bump.ptcl` starts counting.
+    pub fn satisfy(&mut self, bump: &BumpAllocators, bin_data_start: u32, n_tiles: u32) {
+        // The counters keep counting past the allocation on overflow, so each
+        // value is the exact demand for this frame. 25% + a small constant of
+        // headroom absorbs growth within a stage family.
+        fn grow(current: &mut u32, needed: u32) {
+            *current = (*current).max(needed + needed / 4 + 64);
+        }
+        grow(&mut self.bin_data, bin_data_start + bump.binning);
+        grow(&mut self.ptcl, n_tiles * 64 + bump.ptcl);
+        grow(&mut self.tiles, bump.tile);
+        grow(&mut self.seg_counts, bump.seg_counts);
+        grow(&mut self.segments, bump.segments);
+        grow(&mut self.blend_spill, bump.blend);
+        grow(&mut self.lines, bump.lines);
+    }
+
+    /// Whether these sizes cover the demand reported in `bump`, given the
+    /// same shader-side reserves as [`satisfy`](Self::satisfy).
+    ///
+    /// Some bump counters overflow silently: `bump.segments` is bumped in
+    /// coarse.wgsl without a bounds check (the flag only fires when the ptcl
+    /// command stream or blend stack overflows), so `failed` alone misses an
+    /// exhausted segments buffer.
+    pub fn covers(&self, bump: &BumpAllocators, bin_data_start: u32, n_tiles: u32) -> bool {
+        self.bin_data >= bin_data_start + bump.binning
+            && self.ptcl >= n_tiles * 64 + bump.ptcl
+            && self.tiles >= bump.tile
+            && self.seg_counts >= bump.seg_counts
+            && self.segments >= bump.segments
+            && self.blend_spill >= bump.blend
+            && self.lines >= bump.lines
+    }
+
+    /// Set every field to the larger of `self` and `other`.
+    pub fn merge_max(&mut self, other: &Self) {
+        self.lines = self.lines.max(other.lines);
+        self.bin_data = self.bin_data.max(other.bin_data);
+        self.tiles = self.tiles.max(other.tiles);
+        self.seg_counts = self.seg_counts.max(other.seg_counts);
+        self.segments = self.segments.max(other.segments);
+        self.blend_spill = self.blend_spill.max(other.blend_spill);
+        self.ptcl = self.ptcl.max(other.ptcl);
+    }
+}
+
 /// CPU side setup and configuration.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct RenderConfig {
     /// GPU side configuration.
     pub gpu: ConfigUniform,
@@ -165,7 +322,29 @@ pub struct RenderConfig {
 }
 
 impl RenderConfig {
+    /// Creates the configuration with the historical fixed bump-buffer sizes.
+    ///
+    /// Prefer [`RenderConfig::with_buffer_sizes`], which sizes the
+    /// bump-allocated buffers from the scene.
     pub fn new(layout: &Layout, width: u32, height: u32, base_color: &peniko::Color) -> Self {
+        Self::with_buffer_sizes(
+            layout,
+            width,
+            height,
+            base_color,
+            Some(&BumpBufferSizes::default()),
+        )
+    }
+
+    /// Creates the configuration, sizing the bump-allocated buffers to `bump`;
+    /// `None` derives them from the scene layout and the render target.
+    pub fn with_buffer_sizes(
+        layout: &Layout,
+        width: u32,
+        height: u32,
+        base_color: &peniko::Color,
+        bump: Option<&BumpBufferSizes>,
+    ) -> Self {
         let new_width = width.next_multiple_of(TILE_WIDTH);
         let new_height = height.next_multiple_of(TILE_HEIGHT);
         let width_in_tiles = new_width / TILE_WIDTH;
@@ -173,7 +352,10 @@ impl RenderConfig {
         let n_path_tags = layout.path_tags_size();
         let workgroup_counts =
             WorkgroupCounts::new(layout, width_in_tiles, height_in_tiles, n_path_tags);
-        let buffer_sizes = BufferSizes::new(layout, &workgroup_counts);
+        let bump = bump.copied().unwrap_or_else(|| {
+            BumpBufferSizes::for_layout(layout, width_in_tiles, height_in_tiles)
+        });
+        let buffer_sizes = BufferSizes::new(layout, &workgroup_counts, &bump);
         Self {
             gpu: ConfigUniform {
                 width_in_tiles,
@@ -360,7 +542,20 @@ pub struct BufferSizes {
 }
 
 impl BufferSizes {
-    pub fn new(layout: &Layout, workgroups: &WorkgroupCounts) -> Self {
+    /// The bump-allocated buffer sizes used for this configuration.
+    pub fn bump_sizes(&self) -> BumpBufferSizes {
+        BumpBufferSizes {
+            lines: self.lines.len(),
+            bin_data: self.bin_data.len(),
+            tiles: self.tiles.len(),
+            seg_counts: self.seg_counts.len(),
+            segments: self.segments.len(),
+            blend_spill: self.blend_spill.len(),
+            ptcl: self.ptcl.len(),
+        }
+    }
+
+    pub fn new(layout: &Layout, workgroups: &WorkgroupCounts, bump: &BumpBufferSizes) -> Self {
         let n_paths = layout.n_paths;
         let n_draw_objects = layout.n_draw_objects;
         let n_clips = layout.n_clips;
@@ -395,17 +590,15 @@ impl BufferSizes {
         let aligned_n_bins = align_up(n_bins, 256);
         let bin_headers = BufferSize::new(binning_wgs * aligned_n_bins);
 
-        // The following buffer sizes have been hand picked to accommodate the vello test scenes as
-        // well as paris-30k. These should instead get derived from the scene layout using
-        // reasonable heuristics.
-        let bin_data = BufferSize::new(1 << 18);
-        let tiles = BufferSize::new(1 << 21);
-        let lines = BufferSize::new(1 << 21);
-        let seg_counts = BufferSize::new(1 << 21);
-        let segments = BufferSize::new(1 << 21);
-        // 16 * 16 (1 << 8) is one blend spill, so this allows for 4096 spills.
-        let blend_spill = BufferSize::new(1 << 20);
-        let ptcl = BufferSize::new(1 << 23);
+        // The first `bin_data_start` words of `bin_data` hold the info/bin
+        // prefix, so the buffer can never be smaller than the layout's.
+        let bin_data = BufferSize::new(bump.bin_data.max(layout.bin_data_start));
+        let tiles = BufferSize::new(bump.tiles);
+        let lines = BufferSize::new(bump.lines);
+        let seg_counts = BufferSize::new(bump.seg_counts);
+        let segments = BufferSize::new(bump.segments);
+        let blend_spill = BufferSize::new(bump.blend_spill);
+        let ptcl = BufferSize::new(bump.ptcl);
         Self {
             path_reduced,
             path_reduced2,

@@ -145,7 +145,7 @@ use peniko::ImageData;
 pub use wgpu;
 
 pub use scene::{DrawGlyphs, Scene};
-pub use vello_encoding::{FontEmbolden, Glyph, NormalizedCoord};
+pub use vello_encoding::{BumpBufferSizes, FontEmbolden, Glyph, NormalizedCoord};
 
 use low_level::ShaderId;
 #[cfg(feature = "wgpu")]
@@ -322,18 +322,15 @@ pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 /// This is an assumption which is known to be limiting, and is planned to change.
 #[cfg(feature = "wgpu")]
 pub struct Renderer {
-    #[cfg_attr(
-        not(feature = "hot_reload"),
-        expect(
-            dead_code,
-            reason = "Options are only used to reinitialise on a hot reload"
-        )
-    )]
     options: RendererOptions,
     engine: WgpuEngine,
     resolver: Resolver,
     image_atlas: Option<recording::ImageProxy>,
     shaders: FullShaders,
+    /// Bump-buffer sizes grown from GPU feedback: the largest demand seen so
+    /// far. Merged over `RendererOptions::buffer_sizes` at every render so a
+    /// scene that once overflowed never re-triggers the retry.
+    grown_buffer_sizes: Option<BumpBufferSizes>,
     #[cfg(feature = "debug_layers")]
     debug: debug::DebugRenderer,
     #[cfg(feature = "wgpu-profiler")]
@@ -404,6 +401,18 @@ pub struct RendererOptions {
     ///
     /// For much more discussion of expected usage patterns, see the documentation on that type.
     pub pipeline_cache: Option<wgpu::PipelineCache>,
+
+    /// Initial sizes for the buffers the pipeline bump-allocates on the GPU.
+    ///
+    /// `None` derives them from the render target and the resolved scene
+    /// layout every render — a small multiple of what the scene actually
+    /// touches rather than the historical fixed ~170 MB pool. When a frame
+    /// still overflows, the renderer reads the reported demand back, grows the
+    /// buffers and re-renders that frame, so under-sizing costs a retried
+    /// frame, never a truncated one. Pass `Some(_)` to raise the starting
+    /// point (for example [`BumpBufferSizes::for_target`] at the surface size);
+    /// the result still grows on overflow either way.
+    pub buffer_sizes: Option<BumpBufferSizes>,
 }
 
 #[cfg(feature = "wgpu")]
@@ -417,6 +426,7 @@ impl Default for RendererOptions {
             #[cfg(not(target_os = "macos"))]
             num_init_threads: None,
             pipeline_cache: None,
+            buffer_sizes: None,
         }
     }
 }
@@ -449,6 +459,7 @@ impl Renderer {
             engine,
             resolver: Resolver::new(),
             image_atlas: None,
+            grown_buffer_sizes: None,
             shaders,
             #[cfg(feature = "debug_layers")]
             debug,
@@ -457,6 +468,15 @@ impl Renderer {
             #[cfg(feature = "wgpu-profiler")]
             profile_result: None,
         })
+    }
+
+    /// Overrides the initial bump-buffer sizes used for each render.
+    ///
+    /// `None` derives them from the render target; a set value is merged over
+    /// the sizes grown from earlier overflow feedback, so a viewport shrink
+    /// never discards headroom a denser scene already needed.
+    pub fn set_buffer_sizes(&mut self, sizes: Option<BumpBufferSizes>) {
+        self.options.buffer_sizes = sizes;
     }
 
     /// Renders a scene to the target texture.
@@ -481,26 +501,81 @@ impl Renderer {
         texture: &TextureView,
         params: &RenderParams,
     ) -> Result<()> {
-        let (recording, target) = render::render_full(
-            scene,
-            &mut self.resolver,
-            &self.shaders,
-            &mut self.image_atlas,
-            params,
-        );
-        let external_resources = [ExternalResource::Image(
-            *target.as_image().unwrap(),
-            texture,
-        )];
-        self.engine.run_recording(
-            device,
-            queue,
-            &recording,
-            &external_resources,
-            "render_to_texture",
-            #[cfg(feature = "wgpu-profiler")]
-            &mut self.profiler,
-        )?;
+        // Robust dynamic memory: run the render with the current bump-buffer
+        // sizes and read the `BumpAllocators` feedback back. The counters keep
+        // counting past the allocation on overflow, so a failure reports the
+        // exact demand; grow those buffers and re-render rather than present a
+        // truncated frame. The readback is a ~32-byte download plus a device
+        // poll — one pipeline sync point per frame on real GPUs, the price of
+        // never dropping content.
+        //
+        // An attempt only reveals the demand of stages downstream of the
+        // first failing stage, so in the worst case retries are linear in the
+        // number of bump-allocated buffers — this bound is comfortably above
+        // that. Each attempt strictly grows some buffer toward its true
+        // demand, so the loop always converges or exhausts the bound.
+        const MAX_ATTEMPTS: u32 = 16;
+        // The CPU pipeline sizes its own buffers; the feedback mechanism is
+        // GPU-only, so it keeps the single-pass behaviour and the historical
+        // buffer sizes.
+        let robust = !self.options.use_cpu;
+        for attempt in 1..=MAX_ATTEMPTS {
+            let initial = if self.options.use_cpu {
+                Some(BumpBufferSizes::default())
+            } else {
+                self.initial_buffer_sizes()
+            };
+            let (render, recording, target, bump_buf) = render::render_full(
+                scene,
+                &mut self.resolver,
+                &self.shaders,
+                &mut self.image_atlas,
+                params,
+                initial.as_ref(),
+                robust,
+            );
+            let external_resources = [ExternalResource::Image(
+                *target.as_image().unwrap(),
+                texture,
+            )];
+            self.engine.run_recording(
+                device,
+                queue,
+                &recording,
+                &external_resources,
+                "render_to_texture",
+                #[cfg(feature = "wgpu-profiler")]
+                &mut self.profiler,
+            )?;
+            let bump = self.read_bump_allocators(device, bump_buf)?;
+            self.engine.free_download(bump_buf);
+            match bump {
+                Some(bump) => {
+                    let (used_sizes, bin_data_start, n_tiles) =
+                        render.coarse_config().unwrap_or_default();
+                    // `failed` misses an exhausted `segments` buffer (coarse
+                    // bumps it without a bounds check), so also compare every
+                    // counter against the capacity it ran with.
+                    if !bump.failed() && used_sizes.covers(&bump, bin_data_start, n_tiles) {
+                        break;
+                    }
+                    let mut sizes = used_sizes;
+                    sizes.satisfy(&bump, bin_data_start, n_tiles);
+                    self.grown_buffer_sizes = Some(sizes);
+                    if attempt == MAX_ATTEMPTS {
+                        // Still overflowing after MAX_ATTEMPTS growth rounds;
+                        // the last render may be truncated.
+                        log::error!("bump buffers still overflowing after {attempt} attempts");
+                        break;
+                    }
+                    log::info!(
+                        "bump buffer overflow (attempt {attempt}); \
+                         growing buffers and re-rendering"
+                    );
+                }
+                _ => break,
+            }
+        }
         // N.B. This is horrible; this integration of wgpu-profiler really needs some work...
         #[cfg(feature = "wgpu-profiler")]
         {
@@ -514,6 +589,39 @@ impl Renderer {
         }
 
         Ok(())
+    }
+
+    /// The bump-buffer sizes to start a render with: `RendererOptions`
+    /// override or `None` (derive per-scene), raised to the largest demand the
+    /// renderer has grown to so far.
+    fn initial_buffer_sizes(&self) -> Option<BumpBufferSizes> {
+        let mut initial = self.options.buffer_sizes;
+        if let Some(grown) = &self.grown_buffer_sizes {
+            initial.get_or_insert(*grown).merge_max(grown);
+        }
+        initial
+    }
+
+    /// Read back the `BumpAllocators` counters of the last recording, if the
+    /// render was recorded in robust mode. Blocks until the download lands.
+    #[cfg(feature = "wgpu")]
+    fn read_bump_allocators(
+        &self,
+        device: &Device,
+        bump_buf: recording::BufferProxy,
+    ) -> Result<Option<BumpAllocators>> {
+        let Some(buf) = self.engine.get_download(bump_buf) else {
+            return Ok(None);
+        };
+        let buf_slice = buf.slice(..);
+        let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
+        buf_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
+        let Some(result) = util::block_on_wgpu(device, receiver.receive()) else {
+            return Ok(None);
+        };
+        result?;
+        let mapped = buf_slice.get_mapped_range().unwrap();
+        Ok(Some(bytemuck::pod_read_unaligned(&mapped)))
     }
 
     /// Overwrite `image` with `texture`.
@@ -662,6 +770,8 @@ impl Renderer {
         let result = self
             .render_to_texture_async_internal(device, queue, scene, texture, params)
             .await?;
+        // The async path shares the grown sizes so overflow retries benefit it
+        // too, but it does not retry mid-frame.
 
         #[cfg(feature = "debug_layers")]
         {
@@ -730,12 +840,14 @@ impl Renderer {
         // Currently this is always enabled when the `debug_layers` setting is enabled as the bump
         // counts are used for debug visualiation.
         let robust = cfg!(feature = "debug_layers");
+        let initial_buffer_sizes = self.initial_buffer_sizes();
         let recording = render.render_encoding_coarse(
             encoding,
             &mut self.resolver,
             &self.shaders,
             &mut self.image_atlas,
             params,
+            initial_buffer_sizes.as_ref(),
             robust,
         );
         let target = render.out_image();
@@ -765,6 +877,15 @@ impl Renderer {
         // allocate the blend stack as needed.
         self.engine.free_download(bump_buf);
         // Maybe clear to reuse allocation?
+        if let Some(bump) = &bump
+            && let Some((mut sizes, bin_data_start, n_tiles)) = render.coarse_config()
+            && (bump.failed() || !sizes.covers(bump, bin_data_start, n_tiles))
+        {
+            // This API cannot retry mid-frame, but the grown sizes carry to the
+            // next render so overflow happens at most once per size step.
+            sizes.satisfy(bump, bin_data_start, n_tiles);
+            self.grown_buffer_sizes = Some(sizes);
+        }
         let mut recording = Recording::default();
         render.record_fine(&self.shaders, &mut recording);
         let external_resources = [ExternalResource::Image(target, texture)];
