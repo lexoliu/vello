@@ -67,22 +67,49 @@ fn main() {
 
         let device_handle = &context.devices[surface.dev_id];
 
-        renderers[surface.dev_id]
-            .as_mut()
-            .unwrap()
+        let renderer = renderers[surface.dev_id].as_mut().unwrap();
+        let render_params = vello::RenderParams {
+            base_color: palette::css::BLACK, // Background color
+            width,
+            height,
+            antialiasing_method: AaConfig::Msaa16,
+        };
+        let mut readbacks: Vec<vello::BumpReadback> = renderer
             .render_to_texture(
                 &device_handle.device,
                 &device_handle.queue,
                 &scene,
                 &surface.target_view,
-                &vello::RenderParams {
-                    base_color: palette::css::BLACK, // Background color
-                    width,
-                    height,
-                    antialiasing_method: AaConfig::Msaa16,
-                },
+                &render_params,
             )
-            .expect("failed to render to surface");
+            .expect("failed to render to surface")
+            .into_iter()
+            .collect();
+        // Verify the deferred bump-buffer feedback before presenting; an
+        // overflowed frame is re-rendered with grown buffers rather than
+        // presented truncated.
+        for _ in 0..16 {
+            let overflowed = renderer
+                .verify_bump_readbacks(&device_handle.device, readbacks)
+                .expect("failed to verify render");
+            if overflowed.is_empty() {
+                break;
+            }
+            readbacks = Vec::new();
+            for _index in overflowed {
+                readbacks.extend(
+                    renderer
+                        .render_to_texture(
+                            &device_handle.device,
+                            &device_handle.queue,
+                            &scene,
+                            &surface.target_view,
+                            &render_params,
+                        )
+                        .expect("failed to render to surface"),
+                );
+            }
+        }
 
         let surface_texture = surface
             .surface

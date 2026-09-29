@@ -150,9 +150,29 @@ pub async fn get_scene_image(
         view_formats: &[],
     });
     let view = target.create_view(&wgpu::TextureViewDescriptor::default());
-    renderer
+    // Each render returns a `BumpReadback` ticket; resolve it before reading
+    // the target back and re-render on overflow.
+    let mut readbacks: Vec<vello::BumpReadback> = renderer
         .render_to_texture(device, queue, scene, &view, &render_params)
-        .or_else(|_| bail!("Got non-Send/Sync error from rendering"))?;
+        .or_else(|_| bail!("Got non-Send/Sync error from rendering"))?
+        .into_iter()
+        .collect();
+    for _ in 0..16 {
+        let overflowed = renderer
+            .verify_bump_readbacks(device, readbacks)
+            .or_else(|_| bail!("Got non-Send/Sync error from verification"))?;
+        if overflowed.is_empty() {
+            break;
+        }
+        readbacks = Vec::new();
+        for _index in overflowed {
+            readbacks.extend(
+                renderer
+                    .render_to_texture(device, queue, scene, &view, &render_params)
+                    .or_else(|_| bail!("Got non-Send/Sync error from rendering"))?,
+            );
+        }
+    }
     let padded_byte_width = (width * 4).next_multiple_of(256);
     let buffer_size = padded_byte_width as u64 * height as u64;
     let buffer = device.create_buffer(&BufferDescriptor {

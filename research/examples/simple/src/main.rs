@@ -140,22 +140,49 @@ impl ApplicationHandler for SimpleVelloApp {
                 let device_handle = &self.context.devices[surface.dev_id];
 
                 // Render to a texture, which we will later copy into the surface
-                self.renderers[surface.dev_id]
-                    .as_mut()
-                    .unwrap()
+                let renderer = self.renderers[surface.dev_id].as_mut().unwrap();
+                let render_params = vello::RenderParams {
+                    base_color: palette::css::BLACK, // Background color
+                    width,
+                    height,
+                    antialiasing_method: AaConfig::Msaa16,
+                };
+                let mut readbacks: Vec<vello::BumpReadback> = renderer
                     .render_to_texture(
                         &device_handle.device,
                         &device_handle.queue,
                         &self.scene,
                         &surface.target_view,
-                        &vello::RenderParams {
-                            base_color: palette::css::BLACK, // Background color
-                            width,
-                            height,
-                            antialiasing_method: AaConfig::Msaa16,
-                        },
+                        &render_params,
                     )
-                    .expect("failed to render to surface");
+                    .expect("failed to render to surface")
+                    .into_iter()
+                    .collect();
+                // Verify the deferred bump-buffer feedback before presenting;
+                // an overflowed frame is re-rendered with grown buffers
+                // rather than presented truncated.
+                for _ in 0..16 {
+                    let overflowed = renderer
+                        .verify_bump_readbacks(&device_handle.device, readbacks)
+                        .expect("failed to verify render");
+                    if overflowed.is_empty() {
+                        break;
+                    }
+                    readbacks = Vec::new();
+                    for _index in overflowed {
+                        readbacks.extend(
+                            renderer
+                                .render_to_texture(
+                                    &device_handle.device,
+                                    &device_handle.queue,
+                                    &self.scene,
+                                    &surface.target_view,
+                                    &render_params,
+                                )
+                                .expect("failed to render to surface"),
+                        );
+                    }
+                }
 
                 // Get the surface's texture
                 let surface_texture = match surface.surface.get_current_texture() {

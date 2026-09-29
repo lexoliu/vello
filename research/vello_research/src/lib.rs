@@ -59,8 +59,10 @@
 //! scene.pop_layer(...);
 //!
 //! let texture = device.create_texture(&...);
-//! // Render to a wgpu Texture
-//! renderer
+//! // Render to a wgpu Texture. The render returns a `BumpReadback` ticket
+//! // (`None` on the CPU path): verify it later — e.g. at the start of the
+//! // next frame — before the texture is presented or sampled.
+//! let mut readbacks: Vec<BumpReadback> = renderer
 //!    .render_to_texture(
 //!       &device,
 //!       &queue,
@@ -73,7 +75,27 @@
 //!          antialiasing_method: AaConfig::Msaa16,
 //!       },
 //!    )
-//!    .expect("Failed to render to a texture");
+//!    .expect("Failed to render to a texture")
+//!    .into_iter()
+//!    .collect();
+//! loop {
+//!    // Resolves without a CPU wait once the GPU finished the renders;
+//!    // overflowed renders get grown buffers and must be re-issued rather
+//!    // than shown truncated.
+//!    let overflowed = renderer
+//!       .verify_bump_readbacks(&device, readbacks)
+//!       .expect("Failed to verify render");
+//!    if overflowed.is_empty() { break; }
+//!    readbacks = Vec::new();
+//!    for _index in overflowed {
+//!       readbacks.extend(renderer.render_to_texture(&device, &queue, &scene, &texture, &vello::RenderParams {
+//!          base_color: palette::css::BLACK,
+//!          width,
+//!          height,
+//!          antialiasing_method: AaConfig::Msaa16,
+//!       }).expect("Failed to render to a texture"));
+//!    }
+//! }
 //! // Do things with surface texture, such as blitting it to the Surface using
 //! // wgpu::util::TextureBlitter.
 //! ```
@@ -160,7 +182,13 @@ use vello_encoding::{BumpAllocators, Resolver};
 use wgpu_engine::{ExternalResource, WgpuEngine};
 
 #[cfg(feature = "wgpu")]
-use std::{num::NonZeroUsize, sync::atomic::AtomicBool};
+use std::{
+    num::NonZeroUsize,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 #[cfg(feature = "wgpu")]
 use wgpu::{Device, Queue, TextureView};
 #[cfg(all(feature = "wgpu", feature = "wgpu-profiler"))]
@@ -438,6 +466,73 @@ struct RenderResult {
     captured: Option<render::CapturedBuffers>,
 }
 
+/// A submitted render's bump-allocator readback, resolved lazily.
+///
+/// [`Renderer::render_to_texture`] issues the counters download at submit
+/// time and hands the caller one of these instead of blocking on the GPU;
+/// [`Renderer::verify_bump_readbacks`] resolves them before the frame's
+/// targets are presented or sampled — typically one present interval later,
+/// when the GPU has already finished the frame. The caller owns the ticket,
+/// so renders sharing a `Renderer` verify exactly the readbacks they
+/// submitted, never a sibling's.
+///
+/// Dropping an unresolved ticket is safe: its feedback is simply never
+/// applied.
+#[cfg(feature = "wgpu")]
+pub struct BumpReadback {
+    /// Recording-side id of the download, returned to the pool via
+    /// [`WgpuEngine::free_download`].
+    proxy: recording::BufferProxy,
+    /// The staging buffer holding the counters once the GPU catches up.
+    buf: wgpu::Buffer,
+    receiver:
+        futures_intrusive::channel::shared::OneshotReceiver<Result<(), wgpu::BufferAsyncError>>,
+    /// Set by the map callback, so a caller can tell a resolved download from
+    /// one still on the GPU without consuming the ticket. `device.poll`
+    /// (or a wait) is what makes a completed download visible here.
+    ready: Arc<AtomicBool>,
+    /// The sizes, layout reserves and tile count the render ran with; the
+    /// drain compares the read counters against them because `bump.failed`
+    /// misses buffers the shaders bump without a bounds check.
+    feedback: Option<(BumpBufferSizes, u32, u32)>,
+    /// The submission carrying this readback's GPU-side work, captured at
+    /// `queue.submit` time so a caller can wait on exactly this submission —
+    /// a later `queue.submit` cannot extend a watch scoped to it.
+    submission_index: wgpu::SubmissionIndex,
+}
+
+#[cfg(feature = "wgpu")]
+impl BumpReadback {
+    /// Whether this readback's download has resolved — its map callback has
+    /// run. `device.poll` (or a wait) is what advances a `false` here; check
+    /// after polling if a stale `false` would cost a frame.
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    /// The [`wgpu::SubmissionIndex`] of the `queue.submit` that carried this
+    /// readback's copy. Waiting on it — `PollType::Wait` with
+    /// `submission_index: Some(_)` — covers every submission the render
+    /// issued, since queue submissions complete in order.
+    pub fn submission_index(&self) -> wgpu::SubmissionIndex {
+        self.submission_index.clone()
+    }
+}
+
+/// Poll `fut` once, returning its output only if it is already ready.
+///
+/// Used for the no-wait fast path in [`Renderer::verify_bump_readbacks`]:
+/// wgpu resolves `map_async` callbacks during `device.poll`, so a completed
+/// readback is visible here without blocking.
+#[cfg(feature = "wgpu")]
+fn poll_ready_once<F: Future>(fut: F) -> Option<F::Output> {
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match std::pin::pin!(fut).poll(&mut context) {
+        std::task::Poll::Ready(output) => Some(output),
+        std::task::Poll::Pending => None,
+    }
+}
+
 #[cfg(feature = "wgpu")]
 impl Renderer {
     /// Creates a new renderer for the specified device.
@@ -500,82 +595,48 @@ impl Renderer {
         scene: &Scene,
         texture: &TextureView,
         params: &RenderParams,
-    ) -> Result<()> {
-        // Robust dynamic memory: run the render with the current bump-buffer
-        // sizes and read the `BumpAllocators` feedback back. The counters keep
-        // counting past the allocation on overflow, so a failure reports the
-        // exact demand; grow those buffers and re-render rather than present a
-        // truncated frame. The readback is a ~32-byte download plus a device
-        // poll — one pipeline sync point per frame on real GPUs, the price of
-        // never dropping content.
+    ) -> Result<Option<BumpReadback>> {
+        // Robust dynamic memory: the render runs with the current bump-buffer
+        // sizes and a download of its `BumpAllocators` feedback is issued at
+        // submit time without blocking. The returned [`BumpReadback`] is the
+        // caller's to resolve — [`Self::verify_bump_readbacks`] flags a render
+        // whose buffers overflowed so it can be re-rendered before the
+        // texture is presented or sampled. Overflow costs a retried frame,
+        // never a truncated one; a frame that fits costs no CPU wait for the
+        // GPU when verification is deferred past its execution.
         //
-        // An attempt only reveals the demand of stages downstream of the
-        // first failing stage, so in the worst case retries are linear in the
-        // number of bump-allocated buffers — this bound is comfortably above
-        // that. Each attempt strictly grows some buffer toward its true
-        // demand, so the loop always converges or exhausts the bound.
-        const MAX_ATTEMPTS: u32 = 16;
         // The CPU pipeline sizes its own buffers; the feedback mechanism is
-        // GPU-only, so it keeps the single-pass behaviour and the historical
-        // buffer sizes.
+        // GPU-only, so it keeps the historical buffer sizes and issues no
+        // readback (the returned ticket is `None`).
         let robust = !self.options.use_cpu;
-        for attempt in 1..=MAX_ATTEMPTS {
-            let initial = if self.options.use_cpu {
-                Some(BumpBufferSizes::default())
-            } else {
-                self.initial_buffer_sizes()
-            };
-            let (render, recording, target, bump_buf) = render::render_full(
-                scene,
-                &mut self.resolver,
-                &self.shaders,
-                &mut self.image_atlas,
-                params,
-                initial.as_ref(),
-                robust,
-            );
-            let external_resources = [ExternalResource::Image(
-                *target.as_image().unwrap(),
-                texture,
-            )];
-            self.engine.run_recording(
-                device,
-                queue,
-                &recording,
-                &external_resources,
-                "render_to_texture",
-                #[cfg(feature = "wgpu-profiler")]
-                &mut self.profiler,
-            )?;
-            let bump = self.read_bump_allocators(device, bump_buf)?;
-            self.engine.free_download(bump_buf);
-            match bump {
-                Some(bump) => {
-                    let (used_sizes, bin_data_start, n_tiles) =
-                        render.coarse_config().unwrap_or_default();
-                    // `failed` misses an exhausted `segments` buffer (coarse
-                    // bumps it without a bounds check), so also compare every
-                    // counter against the capacity it ran with.
-                    if !bump.failed() && used_sizes.covers(&bump, bin_data_start, n_tiles) {
-                        break;
-                    }
-                    let mut sizes = used_sizes;
-                    sizes.satisfy(&bump, bin_data_start, n_tiles);
-                    self.grown_buffer_sizes = Some(sizes);
-                    if attempt == MAX_ATTEMPTS {
-                        // Still overflowing after MAX_ATTEMPTS growth rounds;
-                        // the last render may be truncated.
-                        log::error!("bump buffers still overflowing after {attempt} attempts");
-                        break;
-                    }
-                    log::info!(
-                        "bump buffer overflow (attempt {attempt}); \
-                         growing buffers and re-rendering"
-                    );
-                }
-                _ => break,
-            }
-        }
+        let initial = if self.options.use_cpu {
+            Some(BumpBufferSizes::default())
+        } else {
+            self.initial_buffer_sizes()
+        };
+        let (render, recording, target, bump_buf) = render::render_full(
+            scene,
+            &mut self.resolver,
+            &self.shaders,
+            &mut self.image_atlas,
+            params,
+            initial.as_ref(),
+            robust,
+        );
+        let external_resources = [ExternalResource::Image(
+            *target.as_image().unwrap(),
+            texture,
+        )];
+        let submission_index = self.engine.run_recording(
+            device,
+            queue,
+            &recording,
+            &external_resources,
+            "render_to_texture",
+            #[cfg(feature = "wgpu-profiler")]
+            &mut self.profiler,
+        )?;
+        let readback = self.issue_bump_readback(bump_buf, &render, submission_index);
         // N.B. This is horrible; this integration of wgpu-profiler really needs some work...
         #[cfg(feature = "wgpu-profiler")]
         {
@@ -588,7 +649,79 @@ impl Renderer {
             }
         }
 
-        Ok(())
+        Ok(readback)
+    }
+
+    /// Resolve the bump-allocator feedback of a batch of submitted renders.
+    ///
+    /// Each [`Self::render_to_texture`] submits a ~32-byte counters download
+    /// that resolves asynchronously with the same GPU completion the frame's
+    /// own presentation needs. Pass its [`BumpReadback`] ticket(s) back here
+    /// once the GPU has had time to finish them — typically at the start of
+    /// the next frame, before their targets are composited — so a completed
+    /// download costs only a device poll. The wait below engages only when
+    /// the GPU has not caught up with the submission by the time the caller
+    /// needs the answer (e.g. a frame of GPU work longer than the interval
+    /// verification was deferred across): that wait is the frame's own
+    /// backpressure, not overhead this API adds.
+    ///
+    /// Returns the positions — within `readbacks` — of the renders whose
+    /// buffers overflowed. Buffer sizes have already grown to cover each
+    /// one's reported demand, so re-issuing the identical scene once and
+    /// verifying its new tickets converges in one growth round — a
+    /// still-overflowing result after that means the size accounting is
+    /// buggy and is the caller's error to report, not a retry to take.
+    /// Only pass readbacks this renderer issued.
+    pub fn verify_bump_readbacks(
+        &mut self,
+        device: &Device,
+        readbacks: Vec<BumpReadback>,
+    ) -> Result<Vec<usize>> {
+        // Pump wgpu callbacks once so readbacks whose GPU work already
+        // completed resolve without entering the wait loop per entry. A
+        // failed poll surfaces through the tickets themselves — unresolved
+        // readbacks flag for re-render below — so warn and continue.
+        if let Err(error) = device.poll(wgpu::PollType::Poll) {
+            log::warn!("vello: device poll failed during bump verification: {error:?}");
+        }
+        let mut overflowed = Vec::new();
+        for (index, check) in readbacks.into_iter().enumerate() {
+            let received = match poll_ready_once(check.receiver.receive()) {
+                Some(received) => received,
+                // The GPU has not caught up with this submission yet: wait for
+                // it. This is the only blocking path, and it only runs when
+                // the frame's own GPU work is incomplete at verify time.
+                None => util::block_on_wgpu(device, check.receiver.receive()),
+            };
+            let Some(result) = received else {
+                // The map callback never ran (e.g. the device was lost); the
+                // render cannot be verified, so report it for re-render
+                // rather than let a possibly-truncated target through.
+                self.engine.free_download(check.proxy);
+                overflowed.push(index);
+                continue;
+            };
+            result?;
+            let bump: BumpAllocators =
+                bytemuck::pod_read_unaligned(&check.buf.slice(..).get_mapped_range().unwrap());
+            check.buf.unmap();
+            self.engine.free_download(check.proxy);
+            let Some((mut sizes, bin_data_start, n_tiles)) = check.feedback else {
+                // Submitted with robust sizing but no recorded sizes — cannot
+                // prove the render fits, so flag it for re-render.
+                overflowed.push(index);
+                continue;
+            };
+            // `failed` misses an exhausted `segments` buffer (coarse bumps it
+            // without a bounds check), so also compare every counter against
+            // the capacity the render ran with.
+            if bump.failed() || !sizes.covers(&bump, bin_data_start, n_tiles) {
+                sizes.satisfy(&bump, bin_data_start, n_tiles);
+                self.grown_buffer_sizes = Some(sizes);
+                overflowed.push(index);
+            }
+        }
+        Ok(overflowed)
     }
 
     /// The bump-buffer sizes to start a render with: `RendererOptions`
@@ -602,26 +735,36 @@ impl Renderer {
         initial
     }
 
-    /// Read back the `BumpAllocators` counters of the last recording, if the
-    /// render was recorded in robust mode. Blocks until the download lands.
-    #[cfg(feature = "wgpu")]
-    fn read_bump_allocators(
-        &self,
-        device: &Device,
+    /// Issue the `BumpAllocators` counters download for a just-submitted
+    /// render and return its [`BumpReadback`] ticket to the caller. Never
+    /// blocks: the map resolves when the GPU catches up with the submission.
+    /// `None` when the render recorded no download (the CPU path).
+    ///
+    /// `submission_index` identifies the `queue.submit` the download rode
+    /// along on, so a waiter can poll for exactly that submission rather
+    /// than the latest at poll time.
+    fn issue_bump_readback(
+        &mut self,
         bump_buf: recording::BufferProxy,
-    ) -> Result<Option<BumpAllocators>> {
-        let Some(buf) = self.engine.get_download(bump_buf) else {
-            return Ok(None);
-        };
-        let buf_slice = buf.slice(..);
+        render: &Render,
+        submission_index: wgpu::SubmissionIndex,
+    ) -> Option<BumpReadback> {
+        let buf = self.engine.get_download(bump_buf)?;
         let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
-        buf_slice.map_async(wgpu::MapMode::Read, move |v| sender.send(v).unwrap());
-        let Some(result) = util::block_on_wgpu(device, receiver.receive()) else {
-            return Ok(None);
-        };
-        result?;
-        let mapped = buf_slice.get_mapped_range().unwrap();
-        Ok(Some(bytemuck::pod_read_unaligned(&mapped)))
+        let ready = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ready);
+        buf.slice(..).map_async(wgpu::MapMode::Read, move |v| {
+            flag.store(true, Ordering::Release);
+            sender.send(v).unwrap();
+        });
+        Some(BumpReadback {
+            proxy: bump_buf,
+            buf: buf.clone(),
+            receiver,
+            ready,
+            feedback: render.coarse_config(),
+            submission_index,
+        })
     }
 
     /// Overwrite `image` with `texture`.
@@ -683,7 +826,7 @@ impl Renderer {
         // Create a fake, empty blob which will be used to back the returned image
         // This image data will never be read by Vello, due to being added to
         // image_overrides, below.
-        let fake_blob = peniko::Blob::new(std::sync::Arc::new(&[]));
+        let fake_blob = peniko::Blob::new(Arc::new(&[]));
 
         let image = ImageData {
             data: fake_blob,
@@ -760,7 +903,7 @@ impl Renderer {
     ) -> Result<Option<BumpAllocators>> {
         if cfg!(not(feature = "debug_layers")) && !debug_layers.is_empty() {
             static HAS_WARNED: AtomicBool = AtomicBool::new(false);
-            if !HAS_WARNED.swap(true, std::sync::atomic::Ordering::Release) {
+            if !HAS_WARNED.swap(true, Ordering::Release) {
                 log::warn!(
                     "Requested debug layers {debug_layers:?} but `debug_layers` feature is not enabled"
                 );
@@ -801,7 +944,7 @@ impl Renderer {
                 captured.release_buffers(&mut recording);
             }
             let external_resources = [ExternalResource::Image(target_proxy, texture)];
-            self.engine.run_recording(
+            let _ = self.engine.run_recording(
                 device,
                 queue,
                 &recording,
@@ -854,7 +997,7 @@ impl Renderer {
         let bump_buf = render.bump_buf();
         #[cfg(feature = "debug_layers")]
         let captured = render.take_captured_buffers();
-        self.engine.run_recording(
+        let _ = self.engine.run_recording(
             device,
             queue,
             &recording,
@@ -889,7 +1032,7 @@ impl Renderer {
         let mut recording = Recording::default();
         render.record_fine(&self.shaders, &mut recording);
         let external_resources = [ExternalResource::Image(target, texture)];
-        self.engine.run_recording(
+        let _ = self.engine.run_recording(
             device,
             queue,
             &recording,
