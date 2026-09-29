@@ -24,6 +24,10 @@ pub struct Render {
     fine_wg_count: Option<WorkgroupSize>,
     fine_resources: Option<FineResources>,
     mask_buf: Option<ResourceProxy>,
+    /// The bump-allocated buffer sizes the in-progress render was configured
+    /// with, plus `Layout::bin_data_start` and the tile count, for growing
+    /// the buffers on overflow.
+    coarse_config: Option<(vello_encoding::BumpBufferSizes, u32, u32)>,
 
     #[cfg(feature = "debug_layers")]
     captured_buffers: Option<CapturedBuffers>,
@@ -87,28 +91,24 @@ pub(crate) fn render_full(
     shaders: &FullShaders,
     image_atlas: &mut Option<ImageProxy>,
     params: &RenderParams,
-) -> (Recording, ResourceProxy) {
-    render_encoding_full(scene.encoding(), resolver, shaders, image_atlas, params)
-}
-
-#[cfg(feature = "wgpu")]
-/// Create a single recording with both coarse and fine render stages.
-///
-/// This function is not recommended when the scene can be complex, as it does not
-/// implement robust dynamic memory.
-pub(crate) fn render_encoding_full(
-    encoding: &Encoding,
-    resolver: &mut Resolver,
-    shaders: &FullShaders,
-    image_atlas: &mut Option<ImageProxy>,
-    params: &RenderParams,
-) -> (Recording, ResourceProxy) {
+    bump_sizes: Option<&vello_encoding::BumpBufferSizes>,
+    robust: bool,
+) -> (Render, Recording, ResourceProxy, BufferProxy) {
     let mut render = Render::new();
-    let mut recording =
-        render.render_encoding_coarse(encoding, resolver, shaders, image_atlas, params, false);
+    let mut recording = render.render_encoding_coarse(
+        scene.encoding(),
+        resolver,
+        shaders,
+        image_atlas,
+        params,
+        bump_sizes,
+        robust,
+    );
+    // Grab the feedback buffer before `record_fine` consumes the fine resources.
+    let bump_buf = render.bump_buf();
     let out_image = render.out_image();
     render.record_fine(shaders, &mut recording);
-    (recording, out_image.into())
+    (render, recording, out_image.into(), bump_buf)
 }
 
 impl Default for Render {
@@ -123,12 +123,17 @@ impl Render {
             fine_wg_count: None,
             fine_resources: None,
             mask_buf: None,
+            coarse_config: None,
             #[cfg(feature = "debug_layers")]
             captured_buffers: None,
         }
     }
 
     /// Prepare a recording for the coarse rasterization phase.
+    ///
+    /// The `bump_sizes` parameter gives the initial sizes for the
+    /// bump-allocated buffers; `None` derives them from the scene layout and
+    /// render target.
     ///
     /// The `robust` parameter controls whether we're preparing for readback
     /// of the atomic bump buffer, for robust dynamic memory.
@@ -139,6 +144,7 @@ impl Render {
         shaders: &FullShaders,
         persistent_image_atlas: &mut Option<ImageProxy>,
         params: &RenderParams,
+        bump_sizes: Option<&vello_encoding::BumpBufferSizes>,
         robust: bool,
     ) -> Recording {
         use vello_encoding::RenderConfig;
@@ -201,8 +207,18 @@ impl Render {
         for image in images.images {
             recording.write_image(image_atlas, image.1, image.2, image.0.clone());
         }
-        let cpu_config =
-            RenderConfig::new(&layout, params.width, params.height, &params.base_color);
+        let cpu_config = RenderConfig::with_buffer_sizes(
+            &layout,
+            params.width,
+            params.height,
+            &params.base_color,
+            bump_sizes,
+        );
+        self.coarse_config = Some((
+            cpu_config.buffer_sizes.bump_sizes(),
+            layout.bin_data_start,
+            cpu_config.gpu.width_in_tiles * cpu_config.gpu.height_in_tiles,
+        ));
         // HACK: The coarse workgroup counts is the number of active bins.
         if (cpu_config.workgroup_counts.coarse.0
             * cpu_config.workgroup_counts.coarse.1
@@ -644,6 +660,14 @@ impl Render {
             .bump_buf
             .as_buf()
             .unwrap()
+    }
+
+    /// The bump-buffer sizes, `bin_data` prefix length and tile count the
+    /// coarse pass ran with, for growing the buffers after an overflow.
+    /// `None` before [`render_encoding_coarse`](Self::render_encoding_coarse)
+    /// has run.
+    pub fn coarse_config(&self) -> Option<(vello_encoding::BumpBufferSizes, u32, u32)> {
+        self.coarse_config
     }
 
     #[cfg(feature = "debug_layers")]

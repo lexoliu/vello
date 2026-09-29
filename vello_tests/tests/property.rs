@@ -35,8 +35,8 @@ fn simple_square(use_cpu: bool) {
     assert_eq!(image.format, ImageFormat::Rgba8);
     let mut red_count = 0;
     let mut black_count = 0;
-    for pixel in image.data.data().chunks_exact(4) {
-        let &[r, g, b, a] = pixel else { unreachable!() };
+    for pixel in image.data.data().as_chunks::<4>().0 {
+        let [r, g, b, a] = *pixel;
         let is_red = r == 255 && g == 0 && b == 0 && a == 255;
         let is_black = r == 0 && g == 0 && b == 0 && a == 255;
         if !is_red && !is_black {
@@ -67,8 +67,8 @@ fn empty_scene(use_cpu: bool) {
     };
     let image = vello_tests::render_then_debug_sync(&scene, &params).unwrap();
     assert_eq!(image.format, ImageFormat::Rgba8);
-    for pixel in image.data.data().chunks_exact(4) {
-        let &[r, g, b, a] = pixel else { unreachable!() };
+    for pixel in image.data.data().as_chunks::<4>().0 {
+        let [r, g, b, a] = *pixel;
         let image_color = Color::from_rgba8(r, g, b, a);
         if image_color.premultiply().difference(color.premultiply()) > 1e-4 {
             panic!("Got {image_color:?}, expected clear color {color:?}");
@@ -138,8 +138,15 @@ fn bgra_image() {
     let scene_image =
         vello_tests::render_then_debug_sync(&scene, &TestParams::new("bgra", 2, 2)).unwrap();
     assert_eq!(scene_image.format, ImageFormat::Rgba8);
-    for (i, pixel) in scene_image.data.data().chunks_exact(4).enumerate() {
-        let &[r, g, b, a] = pixel else { unreachable!() };
+    for (i, pixel) in scene_image
+        .data
+        .data()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .enumerate()
+    {
+        let [r, g, b, a] = *pixel;
         let image_color = Color::from_rgba8(r, g, b, a);
         let color = colors[i];
         if image_color.premultiply().difference(color.premultiply()) > 1e-4 {
@@ -183,11 +190,19 @@ fn premultiplied_image() {
         use_cpu: false,
         name: "bgra".into(),
         anti_aliasing: AaConfig::Area,
+        buffer_sizes: None,
     };
     let scene_image = vello_tests::render_then_debug_sync(&scene, &params).unwrap();
     assert_eq!(scene_image.format, ImageFormat::Rgba8);
-    for (i, pixel) in scene_image.data.data().chunks_exact(4).enumerate() {
-        let &[r, g, b, a] = pixel else { unreachable!() };
+    for (i, pixel) in scene_image
+        .data
+        .data()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .enumerate()
+    {
+        let [r, g, b, a] = *pixel;
         let image_color = Color::from_rgba8(r, g, b, a).premultiply();
         let color = colors[i];
         if image_color.difference(color) > 1e-2 {
