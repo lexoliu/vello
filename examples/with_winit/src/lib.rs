@@ -234,6 +234,7 @@ impl ApplicationHandler<UserEvent> for VelloApp {
                         antialiasing_support: AA_CONFIGS.iter().copied().collect(),
                         num_init_threads: NonZeroUsize::new(self.num_init_threads),
                         pipeline_cache: cache.as_ref().map(|(cache, _, _)| cache.clone()),
+                        buffer_sizes: None,
                     },
                 )
                 .map_err(|e| {
@@ -617,9 +618,8 @@ impl ApplicationHandler<UserEvent> for VelloApp {
                     )
                     .expect("failed to render to texture");
                 } else {
-                    self.renderers[surface.dev_id]
-                        .as_mut()
-                        .unwrap()
+                    let renderer = self.renderers[surface.dev_id].as_mut().unwrap();
+                    let mut readbacks: Vec<vello::BumpReadback> = renderer
                         .render_to_texture(
                             &device_handle.device,
                             &device_handle.queue,
@@ -627,7 +627,34 @@ impl ApplicationHandler<UserEvent> for VelloApp {
                             &surface.target_view,
                             &render_params,
                         )
-                        .expect("failed to render to texture");
+                        .expect("failed to render to texture")
+                        .into_iter()
+                        .collect();
+                    // Verify the deferred bump-buffer feedback before
+                    // blitting; an overflowed frame is re-rendered with grown
+                    // buffers rather than presented truncated.
+                    for _ in 0..16 {
+                        let overflowed = renderer
+                            .verify_bump_readbacks(&device_handle.device, readbacks)
+                            .expect("failed to verify render");
+                        if overflowed.is_empty() {
+                            break;
+                        }
+                        readbacks = Vec::new();
+                        for _index in overflowed {
+                            readbacks.extend(
+                                renderer
+                                    .render_to_texture(
+                                        &device_handle.device,
+                                        &device_handle.queue,
+                                        &self.scene,
+                                        &surface.target_view,
+                                        &render_params,
+                                    )
+                                    .expect("failed to render to texture"),
+                            );
+                        }
+                    }
                 }
                 drop(render_span);
 
